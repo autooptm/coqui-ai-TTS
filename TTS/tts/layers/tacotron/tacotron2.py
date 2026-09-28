@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 from torch import nn
@@ -8,6 +9,150 @@ from .attentions import init_attn
 from .common_layers import Linear, Prenet
 
 logger = logging.getLogger(__name__)
+
+
+_AO_MAX_STEPS = int(os.environ.get("TTS_OPT_MAX_STEPS", "10000"))
+_AO_CACHE_MAX = int(os.environ.get("TTS_OPT_CACHE", "16"))
+_AO_STOP_EVERY = int(os.environ.get("TTS_OPT_STOP_EVERY", "16"))
+
+
+class _AoStepOpt:
+
+    def __init__(self, dec, inputs, processed):
+        self.dec = dec
+        B, T, C = inputs.shape
+        dev, dt = inputs.device, inputs.dtype
+        fc = dec.frame_channels
+        self.r, self.fc = dec.r, fc
+        self.cap = max(1, min(_AO_MAX_STEPS, int(dec.max_decoder_steps)))
+
+        def z(*s):
+            return torch.zeros(*s, device=dev, dtype=dt)
+
+        self.inp, self.proc = z(B, T, C), z(*processed.shape)
+        self.q, self.c = z(B, dec.query_dim), z(B, dec.query_dim)
+        self.dh, self.dc = z(B, dec.decoder_rnn_dim), z(B, dec.decoder_rnn_dim)
+        self.ctx = z(B, dec.encoder_embedding_dim)
+        self.aw, self.awc = z(B, T), z(B, T)
+        self.mem = z(B, fc)
+        self.out, self.stop, self.align = z(self.cap, fc * dec.r), z(self.cap), z(self.cap, T)
+        self.t, self.one = (torch.zeros(1, device=dev, dtype=torch.long),
+                            torch.ones(1, device=dev, dtype=torch.long))
+        self.stop_last = z(1)
+        widths = [lin.linear_layer.out_features for lin in dec.prenet.linear_layers]
+        self.ones = [torch.ones(B, w, device=dev, dtype=dt) for w in widths]
+        self.mbuf = [z(B, w) for w in widths]
+        self.drop_active = bool(getattr(dec.prenet, "prenet_dropout", False)
+                                and (dec.training
+                                     or getattr(dec.prenet, "dropout_at_inference", False)))
+        if not self.drop_active:
+            for buf in self.mbuf:
+                buf.fill_(1.0)
+        self._g = None
+
+    def draw_masks(self):
+        if not self.drop_active:
+            return
+        for ones, buf in zip(self.ones, self.mbuf):
+            buf.copy_(torch.dropout(ones, 0.5, True))
+
+    def _body(self):
+        dec, att = self.dec, self.dec.attention
+        x = self.mem
+        for lin, mask in zip(dec.prenet.linear_layers, self.mbuf):
+            x = torch.relu(lin(x)) * mask
+        query_input = torch.cat((x, self.ctx), -1)
+        q, c = dec.attention_rnn(query_input, (self.q, self.c))
+        attention_cat = torch.cat((self.aw.unsqueeze(1), self.awc.unsqueeze(1)), dim=1)
+        energies = att.v(torch.tanh(att.query_layer(q.unsqueeze(1))
+                                    + att.location_layer(attention_cat) + self.proc))
+        alignment = torch.softmax(energies.squeeze(-1), dim=-1)
+        self.awc += alignment
+        ctx = torch.bmm(alignment.unsqueeze(1), self.inp).squeeze(1)
+        dh, dc = dec.decoder_rnn(torch.cat((q, ctx), -1), (self.dh, self.dc))
+        decoder_output = dec.linear_projection(torch.cat((dh, ctx), dim=1))
+        stopnet_input = torch.cat((dh, decoder_output), dim=1)
+        stop_token = dec.stopnet(stopnet_input.detach() if dec.separate_stopnet else stopnet_input)
+        decoder_output = decoder_output[:, : self.r * self.fc]
+
+        self.out.index_copy_(0, self.t, decoder_output)
+        self.stop_last.copy_(torch.sigmoid(stop_token).view(1))
+        self.stop.index_copy_(0, self.t, self.stop_last)
+        self.align.index_copy_(0, self.t, alignment)
+        self.q.copy_(q); self.c.copy_(c)
+        self.dh.copy_(dh); self.dc.copy_(dc)
+        self.ctx.copy_(ctx)
+        self.aw.copy_(alignment)
+        self.mem.copy_(decoder_output[:, self.fc * (self.r - 1):])
+        self.t += self.one
+
+    def _reset(self, inputs, processed):
+        self.inp.copy_(inputs); self.proc.copy_(processed)
+        for b in (self.q, self.c, self.dh, self.dc, self.ctx, self.aw, self.awc, self.mem):
+            b.zero_()
+        self.t.zero_()
+
+    def build(self, inputs, processed):
+        self._reset(inputs, processed)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self._body()
+        torch.cuda.current_stream().wait_stream(s)
+        self._reset(inputs, processed)
+        self._g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._g):
+            self._body()
+        return self
+
+    def run(self, inputs, processed, guard):
+        self._reset(inputs, processed)
+        cap, thr, every = self.cap, self.dec.stop_threshold, max(1, _AO_STOP_EVERY)
+        n = 0
+        while n < cap:
+            snap = torch.cuda.get_rng_state() if self.drop_active else None
+            chunk = min(every, cap - n)
+            for _ in range(chunk):
+                self.draw_masks()
+                self._g.replay()
+            base, n = n, n + chunk
+            for i, fired in enumerate((self.stop[base:n] > thr).tolist()):
+                if fired and (base + i) > guard:
+                    if snap is not None:
+                        torch.cuda.set_rng_state(snap)
+                        for _ in range(i + 1):
+                            self.draw_masks()
+                    return base + i + 1
+        return n
+
+
+def _ao_opt_for(dec, inputs):
+    if os.environ.get("TTS_NO_OPT") or not inputs.is_cuda or dec.training:
+        return None
+    att = dec.attention
+    if not (att.location_attention and not att.forward_attn and not att.windowing
+            and att.norm == "softmax" and inputs.shape[0] == 1
+            and dec.prenet.prenet_type == "original"):
+        return None
+    cache = getattr(dec, "_ao_opts", None)
+    if cache is None:
+        cache = dec._ao_opts = {}
+    key = int(inputs.shape[1])
+    sg = cache.get(key)
+    if sg is None:
+        processed = att.preprocess_inputs(inputs)
+        try:
+            sg = _AoStepOpt(dec, inputs, processed).build(inputs, processed)
+        except Exception:                       # noqa: BLE001 -- never break synthesis
+            logger.warning("optimized path unavailable; using the stock decoder loop",
+                           exc_info=True)
+            cache[key] = False
+            return None
+        if len(cache) >= _AO_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        cache[key] = sg
+    return sg or None
 
 
 # pylint: disable=no-value-for-parameter
@@ -342,6 +487,14 @@ class Decoder(nn.Module):
             - alignments: (B, T_in, T_out)
             - stop_tokens: (B, T_out)
         """
+        opt_s = _ao_opt_for(self, inputs)
+        if opt_s is not None:
+            processed = self.attention.preprocess_inputs(inputs)
+            n = opt_s.run(inputs, processed, inputs.shape[0] // 2)
+            return (opt_s.out[:n].view(1, n * self.r, self.frame_channels).transpose(1, 2).contiguous(),
+                    opt_s.align[:n].unsqueeze(0),
+                    opt_s.stop[:n].view(1, n, 1))
+
         memory = self.get_go_frame(inputs)
         memory = self._update_memory(memory)
 

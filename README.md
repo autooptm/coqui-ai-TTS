@@ -1,3 +1,66 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>coqui-ai-TTS · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>4.58x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-4.58x-2ea44f"></a>
+    <a href="https://github.com/idiap/coqui-ai-TTS/commit/ca2cf5155bca892ea820ad384400efbfac41b178"><img alt="base" src="https://img.shields.io/badge/upstream-ca2cf5155bca-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-NVIDIA%20RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [idiap/coqui-ai-TTS](https://github.com/idiap/coqui-ai-TTS) at commit
+> [`ca2cf5155bca`](https://github.com/idiap/coqui-ai-TTS/commit/ca2cf5155bca892ea820ad384400efbfac41b178) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+Every change is on by default and the command runs unchanged — same file, same flags, same outputs. Every change is behind a switch that defaults on; see [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result — `python TTS/bin/synthesize.py --text "The quick brown fox jumps over the lazy dog, again and again." --model_name tts_models/en/ljspeech/tacotron2-DDC --out_path out.wav --use_cuda`
+
+| | |
+|---|---|
+| **Command** | `python TTS/bin/synthesize.py --text "The quick brown fox jumps over the lazy dog, again and again." --model_name tts_models/en/ljspeech/tacotron2-DDC --out_path out.wav --use_cuda` |
+| **Entry point** | `TTS/bin/synthesize.py` |
+| **Unit measured** | one sentence synthesised end to end (phonemiser → Tacotron2-DDC → vocoder → waveform) |
+| **Before (stock)** | 678.1 ms per unit |
+| **After (this tree, all switches default ON)** | 111.4 ms per unit |
+| **Speedup** | **4.58x** end to end on NVIDIA RTX 4090, host noise floor 2.5% |
+| **Output** | bit-identical waveform: max_abs_diff = 0 (PSNR 124 dB) against the stock output on the pinned sentences and on holdout |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `TTS/tts/layers/tacotron/tacotron2.py` | Decoder.inference | 2.91x |
+| `TTS/tts/layers/tacotron/tacotron2.py` | Decoder.inference | 1.19x |
+| `TTS/tts/models/base_tts.py` | BaseTTS.synthesize | 1.056x |
+| `TTS/utils/synthesizer.py` | Synthesizer._run_vocoder | 1.056x |
+| `TTS/utils/synthesizer.py` | Synthesizer.tts | 1.056x |
+
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/coqui-ai-TTS-ao.git
+cd coqui-ai-TTS-ao
+# set up exactly as upstream documents, then:
+python TTS/bin/synthesize.py --text "The quick brown fox jumps over the lazy dog, again and again." --model_name tts_models/en/ljspeech/tacotron2-DDC --out_path out.wav --use_cuda
+```
+
+`git diff ca2cf5155bca` is the same change as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+The upstream README is unchanged below.
+
 # <img src="https://raw.githubusercontent.com/idiap/coqui-ai-TTS/main/images/coqui-log-green-TTS.png" height="56"/>
 
 

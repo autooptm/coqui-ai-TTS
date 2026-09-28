@@ -37,6 +37,30 @@ logger = logging.getLogger(__name__)
 PAD_SILENCE_SAMPLES = 10000
 
 
+def _denormalize_torch(ap, S: torch.Tensor) -> torch.Tensor:
+    if not ap.signal_norm:
+        return S
+    if ap.symmetric_norm:
+        if ap.clip_norm:
+            S = S.clamp(-ap.max_norm, ap.max_norm)
+        S = ((S + ap.max_norm) * -ap.min_level_db / (2 * ap.max_norm)) + ap.min_level_db
+        return S + ap.ref_level_db
+    if ap.clip_norm:
+        S = S.clamp(0.0, ap.max_norm)
+    return (S * -ap.min_level_db / ap.max_norm) + ap.min_level_db + ap.ref_level_db
+
+
+def _normalize_torch(ap, S: torch.Tensor) -> torch.Tensor:
+    if not ap.signal_norm:
+        return S
+    S_norm = (S - ap.ref_level_db - ap.min_level_db) / (-ap.min_level_db)
+    if ap.symmetric_norm:
+        S_norm = ((2 * ap.max_norm) * S_norm) - ap.max_norm
+        return S_norm.clamp(-ap.max_norm, ap.max_norm) if ap.clip_norm else S_norm
+    S_norm = ap.max_norm * S_norm
+    return S_norm.clamp(0.0, ap.max_norm) if ap.clip_norm else S_norm
+
+
 class Synthesizer(nn.Module):
     """Inference API for TTS and voice conversion models."""
 
@@ -257,16 +281,23 @@ class Synthesizer(nn.Module):
             Waveform as numpy array.
 
         """
-        mel_postnet_spec = mel_postnet_spec.detach().cpu().numpy()
-        # denormalize tts output based on tts audio config
-        mel_postnet_spec = self.tts_model.ap.denormalize(mel_postnet_spec.T).T
-        # renormalize spectrogram based on vocoder config
-        vocoder_input = self.vocoder_ap.normalize(mel_postnet_spec.T)
         # compute scale factor for possible sample rate mismatch
         scale_factor = [
             1,
             self.vocoder_config["audio"]["sample_rate"] / self.tts_model.ap.sample_rate,
         ]
+        if (scale_factor[1] == 1 and torch.is_tensor(mel_postnet_spec)
+                and not hasattr(self.tts_model.ap, "mel_scaler")
+                and not hasattr(self.vocoder_ap, "mel_scaler")):
+            spec = _denormalize_torch(self.tts_model.ap, mel_postnet_spec.detach().T)
+            vocoder_input = _normalize_torch(self.vocoder_ap, spec).unsqueeze(0)
+            return self.vocoder_model.inference(vocoder_input.to(vocoder_device))
+
+        mel_postnet_spec = mel_postnet_spec.detach().cpu().numpy()
+        # denormalize tts output based on tts audio config
+        mel_postnet_spec = self.tts_model.ap.denormalize(mel_postnet_spec.T).T
+        # renormalize spectrogram based on vocoder config
+        vocoder_input = self.vocoder_ap.normalize(mel_postnet_spec.T)
         if scale_factor[1] != 1:
             logger.info("Interpolating TTS model output.")
             vocoder_input = interpolate_vocoder_input(scale_factor, vocoder_input)
@@ -354,7 +385,7 @@ class Synthesizer(nn.Module):
         split_sentences: bool = True,
         return_dict: bool = False,
         **kwargs: Any,
-    ) -> list[int] | dict[str, Any]:
+    ) -> np.ndarray | dict[str, Any]:
         """🐸 TTS magic. Run all the models and generate speech.
 
         Args:
@@ -371,7 +402,7 @@ class Synthesizer(nn.Module):
             **kwargs: additional arguments to pass to the TTS model.
 
         Returns:
-            List[int]: [description]
+            np.ndarray: the synthesized waveform (was a list of samples)
 
         """
         if self.tts_model is None:
@@ -426,8 +457,8 @@ class Synthesizer(nn.Module):
                 if self.tts_config.audio.get("do_trim_silence"):
                     waveform = waveform[: self.tts_model.ap.find_endpoint(waveform)]
 
-                wavs += list(waveform)
-                wavs += [0] * PAD_SILENCE_SAMPLES
+                wavs.append(waveform)
+                wavs.append(np.zeros(PAD_SILENCE_SAMPLES, dtype=waveform.dtype))
 
                 if return_dict:
                     wav_duration_sec = len(waveform) / self.tts_config.audio["sample_rate"]
@@ -440,6 +471,8 @@ class Synthesizer(nn.Module):
                     segments.append(segment)
                     current_time += wav_duration_sec
                     current_time += PAD_SILENCE_SAMPLES / self.tts_config.audio["sample_rate"]
+
+            wavs = np.concatenate(wavs) if wavs else np.zeros(0, dtype=np.float32)
 
         else:
             outputs = self.tts_model.voice_conversion(

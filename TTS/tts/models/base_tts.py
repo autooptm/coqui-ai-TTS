@@ -663,18 +663,18 @@ class BaseTTS(CloningMixin, BaseTrainerModel):
                 **extra_aux_input,
             },
         )
-        model_outputs = outputs["model_outputs"]
-        model_outputs = model_outputs[0].detach().cpu().numpy().squeeze()
         alignments = outputs["alignments"]
 
         wav = None
-        if model_outputs.ndim == 2:  # [T, C_spec]
-            if use_griffin_lim:
-                wav = inv_spectrogram(model_outputs, self.ap, self.config)
-                if do_trim_silence:
-                    wav = wav[: self.ap.find_endpoint(wav)]
-        else:  # [T,]
-            wav = model_outputs
+        if use_griffin_lim or outputs["model_outputs"][0].squeeze().dim() != 2:
+            model_outputs = outputs["model_outputs"][0].detach().cpu().numpy().squeeze()
+            if model_outputs.ndim == 2:  # [T, C_spec]
+                if use_griffin_lim:
+                    wav = inv_spectrogram(model_outputs, self.ap, self.config)
+                    if do_trim_silence:
+                        wav = wav[: self.ap.find_endpoint(wav)]
+            else:  # [T,]
+                wav = model_outputs
         return {
             "wav": wav,
             "alignments": alignments,
